@@ -23,7 +23,8 @@ from collections import defaultdict
 T1_START, T1_END = 0, 585        # Turno 1: 07:00 - 16:45
 T2_START, T2_END = 570, 1155     # Turno 2: 16:30 - 02:15 (solapamiento 570-585)
 PROD_START, PROD_END = 0, 1155   # Ventana de producción
-MIN_X_PALLET = 3                 # 3 min por pallet
+MIN_STORE_DEF = 3.0              # min/pallet por defecto: guardar/descargar camión
+MIN_SUPPLY_DEF = 3.0             # min/pallet por defecto: abastecer línea
 BASE_DATE = datetime(2024, 1, 1, 7, 0)
 
 UNITS_PER_PALLET = {
@@ -94,17 +95,17 @@ CAT_OPTIONS = ["cilindro", "balde", "tapa_balde", "bot1l", "bot4l",
 # OJO: las unidades por pallet de liners/tapas son ESTIMADAS; verifícalas con tu maestro.
 SAP_DEFAULT_MAP = {
     "Cilindro":      ("cilindro", 4),
-    "Base 19L":     ("balde", 240),
+    "Base 19L":      ("balde", 240),
     "Base 2.5 USG":  ("balde", 400),
     "Botella 1L":    ("bot1l", 1584),
     "Botella 4L":    ("bot4l", 480),
     "Caja":          ("caja", 750),
     "Tapa 19L":      ("tapa_balde", 800),
-    "Tapa 2.5 USG":  ("tapa_balde",1160),
+    "Tapa 2.5 USG":  ("tapa_balde", 1160),
     "Tapa Gln":      ("tapa_lg", 18900),
     "Tapa Lt":       ("tapa_lg", 31500),
     # --- Tipos excluidos por defecto (fuera del alcance de esta bodega) ---
-    "Adhesivo":     ("(ignorar)", 999999),
+    "Adhesivo":      ("(ignorar)", 999999),
     "IBC CART":      ("(ignorar)", 999999),
     "MISC":          ("(ignorar)", 999999),
     "Pallet":        ("(ignorar)", 999999),
@@ -116,7 +117,7 @@ SAP_DEFAULT_MAP = {
     "Contenedor":    ("(ignorar)", 999999),
     "Manga Sachet":  ("(ignorar)", 999999),
     "Cinta":         ("(ignorar)", 999999),
-    "Tapa Bombona":  ("(ignorar)", 999999)
+    "Tapa Bombona":  ("(ignorar)", 999999),
 }
 # Búsqueda normalizada (sin distinguir mayúsculas/espacios)
 SAP_DEFAULT_NORM = {k.strip().lower(): v for k, v in SAP_DEFAULT_MAP.items()}
@@ -207,7 +208,8 @@ def trip_sched(n, lo=0, hi=PROD_END, offset=0):
 @st.cache_data(show_spinner=False)
 def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                    buffer_pallets=4.0, init_items=None,
-                   ide_trips=4, smasac_trips=4, reyemsa_trips=4):
+                   ide_trips=4, smasac_trips=4, reyemsa_trips=4,
+                   min_store=3.0, min_supply=3.0):
     inv = inv_from_items(init_items) if init_items is not None else build_initial_inventory(initial_pct)
 
     prod_min = PROD_END - PROD_START
@@ -239,8 +241,6 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
            "s_min": [], "u_min": [], "i_min": []}
     for z in ZONE_LIST:
         rec[z] = []
-    op_cap = 1.0 / MIN_X_PALLET
-
     for t in range(PROD_START, PROD_END + 1):
         in_t1 = (t <= T1_END)
         if t in arrivals:
@@ -266,11 +266,18 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
         s_min = u_min = i_min = 0.0
         if in_t1:
             supply_backlog += allowed_supply_rate
-            cap = op_cap
-            served_s = min(cap, supply_backlog); supply_backlog -= served_s; cap -= served_s
-            served_u = min(cap, unload_due);     unload_due -= served_u;     cap -= served_u
-            idle = cap
-            s_min, u_min, i_min = served_s * MIN_X_PALLET, served_u * MIN_X_PALLET, idle * MIN_X_PALLET
+            time_left = 1.0  # 1 minuto disponible por iteración
+            # 1) Prioridad absoluta: abastecer líneas (min_supply por pallet)
+            cap_s = time_left / max(min_supply, 1e-9)
+            served_s = min(supply_backlog, cap_s)
+            supply_backlog -= served_s
+            time_left -= served_s * min_supply
+            # 2) Descargar/guardar camiones (min_store por pallet)
+            cap_u = time_left / max(min_store, 1e-9)
+            served_u = min(unload_due, cap_u)
+            unload_due -= served_u
+            time_left -= served_u * min_store
+            s_min, u_min, i_min = served_s * min_supply, served_u * min_store, time_left
             t_supply += s_min; t_unload += u_min; t_idle += i_min
             if supply_backlog > buffer_pallets and not overloaded:
                 quiebre_overload += 1; overloaded = True
@@ -466,6 +473,9 @@ def main():
         st.metric("Factor aplicado", f"x{growth:.2f}")
         operator_cyl = st.checkbox("Operario 1 descarga cilindros (REYEMSA)", False)
         buffer_pallets = st.slider("Tolerancia de espera de líneas (pallets)", 1.0, 10.0, 4.0, 0.5)
+        st.markdown("**⏱️ Tiempos del Operario 1 (min/pallet)**")
+        min_store = st.number_input("Guardar / descargar camión", 0.5, 30.0, MIN_STORE_DEF, 0.5)
+        min_supply = st.number_input("Abastecer línea", 0.5, 30.0, MIN_SUPPLY_DEF, 0.5)
         st.markdown("**🚚 Camiones por día (viajes)**")
         ide_trips = st.number_input("IDE · 24 pallets/viaje", 0, 12, IDE_TRIPS_DEF, 1)
         smasac_trips = st.number_input("SMASAC · 16 pallets/viaje", 0, 12, SMASAC_TRIPS_DEF, 1)
@@ -516,7 +526,8 @@ def main():
 
     # ---- Simulación ----
     df, S = run_simulation(initial_pct, growth, operator_cyl, buffer_pallets, init_items,
-                           int(ide_trips), int(smasac_trips), int(reyemsa_trips))
+                           int(ide_trips), int(smasac_trips), int(reyemsa_trips),
+                           float(min_store), float(min_supply))
 
     if S["max_fict"] > 0.5:
         st.error(f"🚨 **RIESGO DE SEGURIDAD** — Zona Ficticia usada (máx. {S['max_fict']:.0f} pallets "
@@ -574,8 +585,9 @@ consume durante toda la ventana ({PROD_END} min).
 **Zonas (posiciones), total = {TOTAL_POSITIONS}.** Rack = {RACK_TOTAL} (nivel 1 = {RACK_L1} solo
 tapas de balde). Pampa: cilindros 2 de alto (0.5 pos/pallet). ILB: tapas Lt/Gl 3 de alto.
 
-**Operario 1.** 3 min/pallet. Prioridad absoluta: abastecer líneas (salvo cilindros) interrumpe la
-descarga. Quiebre = línea sin stock en bodega o backlog de abastecimiento sobre la tolerancia.
+**Operario 1.** Tiempos de guardado y de abastecimiento configurables (por defecto 3 min/pallet
+cada uno). Prioridad absoluta: abastecer líneas (salvo cilindros) interrumpe la descarga. Quiebre =
+línea sin stock en bodega o backlog de abastecimiento sobre la tolerancia.
 """)
 
 
