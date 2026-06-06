@@ -25,6 +25,7 @@ T2_START, T2_END = 570, 1155     # Turno 2: 16:30 - 02:15 (solapamiento 570-585)
 PROD_START, PROD_END = 0, 1155   # Ventana de producción
 MIN_STORE_DEF = 3.0              # min/pallet por defecto: guardar/descargar camión
 MIN_SUPPLY_DEF = 3.0             # min/pallet por defecto: abastecer línea
+LUNCH_START, LUNCH_END = 300, 345   # Almuerzo Operario 1: 12:00 - 12:45 (45 min)
 BASE_DATE = datetime(2024, 1, 1, 7, 0)
 
 UNITS_PER_PALLET = {
@@ -201,8 +202,10 @@ def inv_from_items(init_items):
 
 
 def trip_sched(n, lo=0, hi=PROD_END, offset=0):
-    return [int(min(hi, max(lo, lo + (hi - lo) * (i + 0.5) / n + offset)))
-            for i in range(n)]
+    # Primer camión al inicio del turno (07:00) y luego repartidos hacia adelante.
+    if n <= 0:
+        return []
+    return [int(min(hi, max(lo, lo + (hi - lo) * i / n + offset))) for i in range(n)]
 
 
 # =====================================================================
@@ -213,10 +216,12 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                    buffer_pallets=4.0, init_items=None,
                    ide_trips=4, smasac_trips=4, reyemsa_trips=4,
                    min_store=3.0, min_supply=3.0,
-                   ide_pallets=15.0, smasac_pallets=14.0, reyemsa_pallets=50.0):
+                   ide_pallets=15.0, smasac_pallets=14.0, reyemsa_pallets=50.0,
+                   lunch_break=True):
     inv = inv_from_items(init_items) if init_items is not None else build_initial_inventory(initial_pct)
 
-    prod_min = PROD_END - PROD_START
+    lunch_minutes = (LUNCH_END - LUNCH_START) if lunch_break else 0
+    prod_min = (PROD_END - PROD_START + 1) - lunch_minutes   # minutos en que las líneas producen
     cons = {it: d * growth / prod_min for it, d in CONS_DAILY.items()}
     caja_daily = (CONS_DAILY["Botella 1L"] * UNITS_PER_PALLET["Botella 1L"]
                   / 12 / UNITS_PER_PALLET["Caja 12x1L"])
@@ -237,18 +242,19 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
         arrivals[tt].append((adds, reyemsa_pallets * growth, operator_unloads_cyl))
 
     supply_backlog = unload_due = 0.0
-    t_supply = t_unload = t_idle = 0.0
+    t_supply = t_unload = t_idle = t_lunch = 0.0
     overloaded = False
     line_short = {ln: False for ln in LINE_ITEMS}
     quiebre_line = {ln: 0 for ln in LINE_ITEMS}
     quiebre_overload = 0
 
     rec = {"minute": [], "tiempo": [], "total_pct": [], "fict": [],
-           "s_min": [], "u_min": [], "i_min": []}
+           "s_min": [], "u_min": [], "i_min": [], "l_min": []}
     for z in ZONE_LIST:
         rec[z] = []
     for t in range(PROD_START, PROD_END + 1):
         in_t1 = (t <= T1_END)
+        on_lunch = lunch_break and (LUNCH_START <= t < LUNCH_END)
         if t in arrivals:
             for adds, pallets, op_handled in arrivals[t]:
                 for k, v in adds.items():
@@ -256,35 +262,40 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                 if in_t1 and op_handled:
                     unload_due += pallets
 
-        for it, r in cons.items():
-            if r <= 0:
-                continue
-            inv[it] -= r
-            if inv[it] < 0:
-                inv[it] = 0.0
-        for ln, items in LINE_ITEMS.items():
-            short = any((it in cons and cons[it] > 0 and inv.get(it, 0.0) <= 1e-9)
-                        for it in items)
-            if short and not line_short[ln]:
-                quiebre_line[ln] += 1
-            line_short[ln] = short
+        if not on_lunch:                      # las líneas no producen durante el almuerzo
+            for it, r in cons.items():
+                if r <= 0:
+                    continue
+                inv[it] -= r
+                if inv[it] < 0:
+                    inv[it] = 0.0
+            for ln, items in LINE_ITEMS.items():
+                short = any((it in cons and cons[it] > 0 and inv.get(it, 0.0) <= 1e-9)
+                            for it in items)
+                if short and not line_short[ln]:
+                    quiebre_line[ln] += 1
+                line_short[ln] = short
 
-        s_min = u_min = i_min = 0.0
+        s_min = u_min = i_min = l_min = 0.0
         if in_t1:
-            supply_backlog += allowed_supply_rate
-            time_left = 1.0  # 1 minuto disponible por iteración
-            # 1) Prioridad absoluta: abastecer líneas (min_supply por pallet)
-            cap_s = time_left / max(min_supply, 1e-9)
-            served_s = min(supply_backlog, cap_s)
-            supply_backlog -= served_s
-            time_left -= served_s * min_supply
-            # 2) Descargar/guardar camiones (min_store por pallet)
-            cap_u = time_left / max(min_store, 1e-9)
-            served_u = min(unload_due, cap_u)
-            unload_due -= served_u
-            time_left -= served_u * min_store
-            s_min, u_min, i_min = served_s * min_supply, served_u * min_store, time_left
-            t_supply += s_min; t_unload += u_min; t_idle += i_min
+            if on_lunch:
+                l_min = 1.0
+                t_lunch += 1.0
+            else:
+                supply_backlog += allowed_supply_rate   # demanda solo si las líneas producen
+                time_left = 1.0  # 1 minuto disponible por iteración
+                # 1) Prioridad absoluta: abastecer líneas (min_supply por pallet)
+                cap_s = time_left / max(min_supply, 1e-9)
+                served_s = min(supply_backlog, cap_s)
+                supply_backlog -= served_s
+                time_left -= served_s * min_supply
+                # 2) Descargar/guardar camiones (min_store por pallet)
+                cap_u = time_left / max(min_store, 1e-9)
+                served_u = min(unload_due, cap_u)
+                unload_due -= served_u
+                time_left -= served_u * min_store
+                s_min, u_min, i_min = served_s * min_supply, served_u * min_store, time_left
+                t_supply += s_min; t_unload += u_min; t_idle += i_min
             if supply_backlog > buffer_pallets and not overloaded:
                 quiebre_overload += 1; overloaded = True
             elif supply_backlog <= buffer_pallets:
@@ -295,18 +306,20 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
         rec["tiempo"].append(BASE_DATE + timedelta(minutes=t))
         rec["total_pct"].append(100.0 * sum(used.values()) / TOTAL_POSITIONS)
         rec["fict"].append(fict)
-        rec["s_min"].append(s_min); rec["u_min"].append(u_min); rec["i_min"].append(i_min)
+        rec["s_min"].append(s_min); rec["u_min"].append(u_min)
+        rec["i_min"].append(i_min); rec["l_min"].append(l_min)
         for z in ZONE_LIST:
             rec[z].append(100.0 * used[z] / ZONE_CAP[z])
 
     df = pd.DataFrame(rec)
     t1_minutes = T1_END - T1_START + 1
+    work_minutes = max(1.0, t1_minutes - t_lunch)
     summary = {
         "peak_total": float(df["total_pct"].max()),
         "final_total": float(df["total_pct"].iloc[-1]),
         "max_fict": float(df["fict"].max()), "final_fict": float(df["fict"].iloc[-1]),
-        "t_supply": t_supply, "t_unload": t_unload, "t_idle": t_idle,
-        "utilizacion": 100.0 * (t_supply + t_unload) / t1_minutes,
+        "t_supply": t_supply, "t_unload": t_unload, "t_idle": t_idle, "t_lunch": t_lunch,
+        "utilizacion": 100.0 * (t_supply + t_unload) / work_minutes,
         "unload_backlog": unload_due, "supply_backlog": supply_backlog,
         "quiebre_line": quiebre_line, "quiebre_overload": quiebre_overload,
         "quiebres_total": sum(quiebre_line.values()) + quiebre_overload, "growth": growth,
@@ -421,11 +434,12 @@ def fig_ocupacion(df):
 
 def fig_operario_tiempo(df):
     d = df[df["minute"] <= T1_END].copy().set_index("tiempo")
-    g = d[["s_min", "u_min", "i_min"]].resample("30min").sum()
+    g = d[["s_min", "u_min", "i_min", "l_min"]].resample("30min").sum()
     fig = go.Figure()
     fig.add_trace(go.Bar(x=g.index, y=g["s_min"], name="Abastecer líneas", marker_color="#28B463"))
     fig.add_trace(go.Bar(x=g.index, y=g["u_min"], name="Descargar camiones", marker_color="#2E86C1"))
     fig.add_trace(go.Bar(x=g.index, y=g["i_min"], name="Tiempo muerto", marker_color="#BDC3C7"))
+    fig.add_trace(go.Bar(x=g.index, y=g["l_min"], name="Almuerzo", marker_color="#F39C12"))
     fig.update_layout(barmode="stack", height=420, yaxis_title="Minutos / 30 min",
                       xaxis_title="Hora (Turno 1)", margin=dict(l=10, r=10, t=30, b=10),
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
@@ -434,9 +448,9 @@ def fig_operario_tiempo(df):
 
 def fig_operario_dona(S):
     fig = go.Figure(go.Pie(
-        labels=["Abastecer líneas", "Descargar camiones", "Tiempo muerto"],
-        values=[S["t_supply"], S["t_unload"], S["t_idle"]], hole=0.55,
-        marker_colors=["#28B463", "#2E86C1", "#BDC3C7"], textinfo="label+percent"))
+        labels=["Abastecer líneas", "Descargar camiones", "Tiempo muerto", "Almuerzo"],
+        values=[S["t_supply"], S["t_unload"], S["t_idle"], S["t_lunch"]], hole=0.55,
+        marker_colors=["#28B463", "#2E86C1", "#BDC3C7", "#F39C12"], textinfo="label+percent"))
     fig.update_layout(height=420, showlegend=False, margin=dict(l=10, r=10, t=10, b=10),
                       annotations=[dict(text="Operario 1<br>Turno 1", showarrow=False, font_size=13)])
     return fig
@@ -482,6 +496,7 @@ def main():
         st.markdown("**⏱️ Tiempos del Operario 1 (min/pallet)**")
         min_store = st.number_input("Guardar / descargar camión", 0.5, 30.0, MIN_STORE_DEF, 0.5)
         min_supply = st.number_input("Abastecer línea", 0.5, 30.0, MIN_SUPPLY_DEF, 0.5)
+        incluir_almuerzo = st.checkbox("Incluir almuerzo Operario 1 (12:00–12:45)", True)
         st.markdown("**🚚 Camiones (viajes/día y pallets/viaje)**")
         ci1, ci2 = st.columns(2)
         ide_trips = ci1.number_input("IDE · viajes", 0, 12, IDE_TRIPS_DEF, 1)
@@ -541,7 +556,8 @@ def main():
     df, S = run_simulation(initial_pct, growth, operator_cyl, buffer_pallets, init_items,
                            int(ide_trips), int(smasac_trips), int(reyemsa_trips),
                            float(min_store), float(min_supply),
-                           float(ide_pallets), float(smasac_pallets), float(reyemsa_pallets))
+                           float(ide_pallets), float(smasac_pallets), float(reyemsa_pallets),
+                           bool(incluir_almuerzo))
 
     if S["max_fict"] > 0.5:
         st.error(f"🚨 **RIESGO DE SEGURIDAD** — Zona Ficticia usada (máx. {S['max_fict']:.0f} pallets "
@@ -594,7 +610,8 @@ de zonificación. Los `Tipo` no reconocidos caen por defecto en **otros** (desbo
 Sótano → ILB → Zona Ficticia). Las unidades por pallet de tapas/liners son estimaciones a calibrar.
 
 **Turnos.** T1 (Operario 1): 07:00–16:45. T2: 16:30–02:15 (solapamiento 15 min). La producción
-consume durante toda la ventana ({PROD_END} min).
+consume durante la ventana de turnos, salvo el almuerzo (12:00–12:45), en que las líneas se
+detienen. Los camiones empiezan a llegar al inicio del turno (07:00) y se reparten hacia adelante.
 
 **Zonas (posiciones), total = {TOTAL_POSITIONS}.** Rack = {RACK_TOTAL} (nivel 1 = {RACK_L1} solo
 tapas de balde). Pampa: cilindros 2 de alto (0.5 pos/pallet). ILB: tapas Lt/Gl 3 de alto.
