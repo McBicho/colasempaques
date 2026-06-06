@@ -96,6 +96,7 @@ CAT_OPTIONS = ["cilindro", "balde", "tapa_balde", "bot1l", "bot4l",
 SAP_DEFAULT_MAP = {
     "Cilindro":      ("cilindro", 4),
     "Base 19L":      ("balde", 240),
+    "Balde 19L":     ("balde",240),
     "Base 2.5 USG":  ("balde", 400),
     "Botella 1L":    ("bot1l", 1584),
     "Botella 4L":    ("bot4l", 480),
@@ -118,6 +119,8 @@ SAP_DEFAULT_MAP = {
     "Manga Sachet":  ("(ignorar)", 999999),
     "Cinta":         ("(ignorar)", 999999),
     "Tapa Bombona":  ("(ignorar)", 999999),
+    "Funfa Pote":    ("(ignorar)", 999999),
+    "Tapa Bot Cilíndrica": ("(ignorar)",999999)
 }
 # Búsqueda normalizada (sin distinguir mayúsculas/espacios)
 SAP_DEFAULT_NORM = {k.strip().lower(): v for k, v in SAP_DEFAULT_MAP.items()}
