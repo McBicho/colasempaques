@@ -96,7 +96,6 @@ CAT_OPTIONS = ["cilindro", "balde", "tapa_balde", "bot1l", "bot4l",
 SAP_DEFAULT_MAP = {
     "Cilindro":      ("cilindro", 4),
     "Base 19L":      ("balde", 240),
-    "Balde 19L":     ("balde",240),
     "Base 2.5 USG":  ("balde", 400),
     "Botella 1L":    ("bot1l", 1584),
     "Botella 4L":    ("bot4l", 480),
@@ -119,8 +118,6 @@ SAP_DEFAULT_MAP = {
     "Manga Sachet":  ("(ignorar)", 999999),
     "Cinta":         ("(ignorar)", 999999),
     "Tapa Bombona":  ("(ignorar)", 999999),
-    "Funda Pote":    ("(ignorar)", 999999),
-    "Tapa Bot Cilíndrica": ("(ignorar)",999999)
 }
 # Búsqueda normalizada (sin distinguir mayúsculas/espacios)
 SAP_DEFAULT_NORM = {k.strip().lower(): v for k, v in SAP_DEFAULT_MAP.items()}
@@ -140,12 +137,15 @@ LINE_ITEMS = {
     "Línea Cilindros":  ["Cilindro"],
 }
 
-# Composición FIJA por viaje (pallets). Total diario = (pallets/viaje) x (nº de viajes).
-IDE_PER_TRIP = {"Balde 19L": 9.5, "Tapa 19L": 5.5, "Balde 2.5USG": 6.0,
-                "Tapa 2.5USG": 2.0, "Tapa Lt": 0.5, "Tapa Gl": 0.5}    # 24 pallets/viaje
-SMASAC_PER_TRIP = {"Botella 1L": 7.0, "Botella 4L": 7.5, "Caja 12x1L": 1.5}  # 16 pallets/viaje
-REYEMSA_CIL_PER_TRIP = 50          # 200 cilindros = 50 pallets/viaje
+# Composición (proporción) por viaje. Se escala al total de pallets/viaje indicado en la app.
+IDE_MIX = {"Balde 19L": 9.5, "Tapa 19L": 5.5, "Balde 2.5USG": 6.0,
+           "Tapa 2.5USG": 2.0, "Tapa Lt": 0.5, "Tapa Gl": 0.5}
+SMASAC_MIX = {"Botella 1L": 7.0, "Botella 4L": 7.5, "Caja 12x1L": 1.5}
+IDE_BASE = sum(IDE_MIX.values())        # 24
+SMASAC_BASE = sum(SMASAC_MIX.values())  # 16
+# Defaults editables en la interfaz
 IDE_TRIPS_DEF, SMASAC_TRIPS_DEF, REYEMSA_TRIPS_DEF = 4, 4, 4
+IDE_PALLETS_DEF, SMASAC_PALLETS_DEF, REYEMSA_PALLETS_DEF = 15, 14, 50
 
 INIT_MIX = {
     "Cilindro": 0.14, "Balde 19L": 0.13, "Balde 2.5USG": 0.09,
@@ -212,7 +212,8 @@ def trip_sched(n, lo=0, hi=PROD_END, offset=0):
 def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                    buffer_pallets=4.0, init_items=None,
                    ide_trips=4, smasac_trips=4, reyemsa_trips=4,
-                   min_store=3.0, min_supply=3.0):
+                   min_store=3.0, min_supply=3.0,
+                   ide_pallets=15.0, smasac_pallets=14.0, reyemsa_pallets=50.0):
     inv = inv_from_items(init_items) if init_items is not None else build_initial_inventory(initial_pct)
 
     prod_min = PROD_END - PROD_START
@@ -223,15 +224,17 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
     allowed_supply_rate = sum(r for it, r in cons.items() if it != "Cilindro")
 
     arrivals = defaultdict(list)
+    ide_f = (ide_pallets / IDE_BASE) * growth
+    sma_f = (smasac_pallets / SMASAC_BASE) * growth
     for tt in trip_sched(ide_trips, offset=0):
-        adds = {k: v * growth for k, v in IDE_PER_TRIP.items()}
+        adds = {k: v * ide_f for k, v in IDE_MIX.items()}
         arrivals[tt].append((adds, sum(adds.values()), True))
     for tt in trip_sched(smasac_trips, offset=90):
-        adds = {k: v * growth for k, v in SMASAC_PER_TRIP.items()}
+        adds = {k: v * sma_f for k, v in SMASAC_MIX.items()}
         arrivals[tt].append((adds, sum(adds.values()), True))
     for tt in trip_sched(reyemsa_trips, offset=45):
-        adds = {"Cilindro": REYEMSA_CIL_PER_TRIP * growth}
-        arrivals[tt].append((adds, REYEMSA_CIL_PER_TRIP * growth, operator_unloads_cyl))
+        adds = {"Cilindro": reyemsa_pallets * growth}
+        arrivals[tt].append((adds, reyemsa_pallets * growth, operator_unloads_cyl))
 
     supply_backlog = unload_due = 0.0
     t_supply = t_unload = t_idle = 0.0
@@ -479,11 +482,18 @@ def main():
         st.markdown("**⏱️ Tiempos del Operario 1 (min/pallet)**")
         min_store = st.number_input("Guardar / descargar camión", 0.5, 30.0, MIN_STORE_DEF, 0.5)
         min_supply = st.number_input("Abastecer línea", 0.5, 30.0, MIN_SUPPLY_DEF, 0.5)
-        st.markdown("**🚚 Camiones por día (viajes)**")
-        ide_trips = st.number_input("IDE · 24 pallets/viaje", 0, 12, IDE_TRIPS_DEF, 1)
-        smasac_trips = st.number_input("SMASAC · 16 pallets/viaje", 0, 12, SMASAC_TRIPS_DEF, 1)
-        reyemsa_trips = st.number_input("REYEMSA · 50 pallets cilindros/viaje", 0, 12, REYEMSA_TRIPS_DEF, 1)
-        entrada_dia = (ide_trips * 24 + smasac_trips * 16 + reyemsa_trips * 50) * growth
+        st.markdown("**🚚 Camiones (viajes/día y pallets/viaje)**")
+        ci1, ci2 = st.columns(2)
+        ide_trips = ci1.number_input("IDE · viajes", 0, 12, IDE_TRIPS_DEF, 1)
+        ide_pallets = ci2.number_input("IDE · pallets/viaje", 1.0, 80.0, float(IDE_PALLETS_DEF), 1.0)
+        cs1, cs2 = st.columns(2)
+        smasac_trips = cs1.number_input("SMASAC · viajes", 0, 12, SMASAC_TRIPS_DEF, 1)
+        smasac_pallets = cs2.number_input("SMASAC · pallets/viaje", 1.0, 80.0, float(SMASAC_PALLETS_DEF), 1.0)
+        cr1, cr2 = st.columns(2)
+        reyemsa_trips = cr1.number_input("REYEMSA · viajes", 0, 12, REYEMSA_TRIPS_DEF, 1)
+        reyemsa_pallets = cr2.number_input("REYEMSA · pallets/viaje", 1.0, 120.0, float(REYEMSA_PALLETS_DEF), 1.0)
+        entrada_dia = (ide_trips * ide_pallets + smasac_trips * smasac_pallets
+                       + reyemsa_trips * reyemsa_pallets) * growth
         st.caption(f"Entrada total ≈ **{entrada_dia:.0f} pallets/día** (con el factor x{growth:.2f}).")
 
     # ---- Construcción del stock inicial ----
@@ -530,7 +540,8 @@ def main():
     # ---- Simulación ----
     df, S = run_simulation(initial_pct, growth, operator_cyl, buffer_pallets, init_items,
                            int(ide_trips), int(smasac_trips), int(reyemsa_trips),
-                           float(min_store), float(min_supply))
+                           float(min_store), float(min_supply),
+                           float(ide_pallets), float(smasac_pallets), float(reyemsa_pallets))
 
     if S["max_fict"] > 0.5:
         st.error(f"🚨 **RIESGO DE SEGURIDAD** — Zona Ficticia usada (máx. {S['max_fict']:.0f} pallets "
