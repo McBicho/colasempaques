@@ -126,6 +126,15 @@ SAP_DEFAULT_MAP = {
 # Búsqueda normalizada (sin distinguir mayúsculas/espacios)
 SAP_DEFAULT_NORM = {k.strip().lower(): v for k, v in SAP_DEFAULT_MAP.items()}
 
+# Movimientos (MB51): Tipo -> ítem de consumo del modelo (claves normalizadas)
+TIPO_TO_ITEM = {
+    "base 19l": "Balde 19L", "base 2.5 usg": "Balde 2.5USG",
+    "tapa 19l": "Tapa 19L", "tapa 2.5 usg": "Tapa 2.5USG",
+    "botella 1l": "Botella 1L", "botella 4l": "Botella 4L",
+    "caja": "Caja 12x1L", "cilindro": "Cilindro",
+    "tapa gln": "Tapa Gl", "tapa lt": "Tapa Lt",
+}
+
 CONS_DAILY = {
     "Balde 19L": 13, "Tapa 19L": 7,
     "Balde 2.5USG": 8, "Tapa 2.5USG": 3,
@@ -220,7 +229,7 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                    ide_trips=4, smasac_trips=4, reyemsa_trips=4,
                    min_store=3.0, min_supply=3.0,
                    ide_pallets=15.0, smasac_pallets=14.0, reyemsa_pallets=50.0,
-                   lunch_break=True):
+                   lunch_break=True, cons_override=None):
     inv = inv_from_items(init_items) if init_items is not None else build_initial_inventory(initial_pct)
 
     # Los consumos de CONS_DAILY son POR TURNO. Las líneas de baldes y botellas operan en
@@ -231,6 +240,9 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
     caja_shift = (CONS_DAILY["Botella 1L"] * UNITS_PER_PALLET["Botella 1L"]
                   / 12 / UNITS_PER_PALLET["Caja 12x1L"])    # cajas por turno (prop. a Bot. 1L)
     per_shift = dict(CONS_DAILY); per_shift["Caja 12x1L"] = caja_shift
+    if cons_override:
+        for k, v in cons_override:
+            per_shift[k] = v
     rate_day = {it: v * growth / day_min for it, v in per_shift.items()}
     rate_night = {it: (0.0 if it == "Cilindro" else v * growth / night_min)
                   for it, v in per_shift.items()}
@@ -425,6 +437,77 @@ def default_mapping(tipos):
     return pd.DataFrame(rows)
 
 
+def parse_movimientos(uploaded):
+    """Lee el reporte de movimientos MB51 (CSV/Excel). Devuelve df: Tipo, Qty, Clase, Fecha."""
+    raw = uploaded.getvalue()
+    name = uploaded.name.lower()
+    df = None
+    if name.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(io.BytesIO(raw))
+    else:
+        for sep in [None, ";", "\t", ","]:
+            try:
+                tmp = pd.read_csv(io.BytesIO(raw), sep=sep, engine="python", thousands=",")
+                if tmp.shape[1] >= 4:
+                    df = tmp
+                    break
+            except Exception:
+                continue
+    if df is None:
+        raise ValueError("No se pudo leer el archivo. Expórtalo como CSV o XLSX.")
+    df.columns = [str(c).strip() for c in df.columns]
+    col_tipo = _find_col(df.columns, "tipo")
+    col_qty = (_find_col(df.columns, "ctd") or _find_col(df.columns, "cantidad")
+               or _find_col(df.columns, "entrada"))
+    col_clase = _find_col(df.columns, "clase")
+    col_fecha = _find_col(df.columns, "contab") or _find_col(df.columns, "fecha")
+    if col_tipo is None or col_qty is None:
+        raise ValueError("Faltan columnas 'Tipo' y/o cantidad ('Ctd.en UM entrada').")
+    qty = df[col_qty]
+    if qty.dtype == object:
+        qty = pd.to_numeric(
+            qty.astype(str).str.replace(",", "", regex=False).str.replace(" ", "", regex=False),
+            errors="coerce")
+    out = pd.DataFrame({
+        "Tipo": df[col_tipo].astype(str).str.strip(),
+        "Qty": qty.fillna(0).astype(float),
+        "Clase": df[col_clase].astype(str).str.strip() if col_clase else "",
+        "Fecha": df[col_fecha].astype(str).str.strip() if col_fecha else "",
+    })
+    out = out[out["Tipo"].str.lower() != "nan"]
+    return out
+
+
+def consumo_diario(mov):
+    """Consumo promedio diario por Tipo + override de consumo POR TURNO para el modelo
+    (no-cilindro = diario/2 por 2 turnos; cilindro = diario, solo turno día)."""
+    is_cons = mov["Clase"].str.lower().str.contains("consumo") | (mov["Qty"] < 0)
+    cons = mov[is_cons].copy()
+    cons["Qty"] = cons["Qty"].abs()
+    fechas = cons["Fecha"][cons["Fecha"].astype(str).str.len() > 0]
+    dias = max(1, fechas.nunique()) if len(fechas) else 1
+    g = cons.groupby("Tipo", as_index=False)["Qty"].sum().rename(columns={"Qty": "Consumo (ud)"})
+    rows, override = [], {}
+    for _, r in g.iterrows():
+        tp = r["Tipo"]; tot = float(r["Consumo (ud)"])
+        cat, udp = SAP_DEFAULT_NORM.get(tp.strip().lower(), ("(?)", None))
+        diario_ud = tot / dias
+        diario_pal = (diario_ud / udp) if (udp and udp > 0) else None
+        item = TIPO_TO_ITEM.get(tp.strip().lower())
+        por_turno = None
+        if item is not None and diario_pal is not None:
+            ps = diario_pal / (1.0 if item == "Cilindro" else 2.0)
+            override[item] = override.get(item, 0.0) + ps
+            por_turno = round(ps, 2)
+        rows.append({"Tipo": tp, "Consumo (ud)": tot, "Días": dias,
+                     "Prom. diario (ud)": round(diario_ud, 1), "Ud/pallet": udp,
+                     "Prom. diario (pallets)": round(diario_pal, 2) if diario_pal is not None else None,
+                     "Ítem modelo": item or "(no usado)", "Por turno (pallets)": por_turno})
+    detalle = pd.DataFrame(rows)
+    cons_override = tuple(sorted((k, round(v, 4)) for k, v in override.items()))
+    return detalle, dias, cons_override
+
+
 def items_from_mapping(raw, mapping):
     """raw: df POR MATERIAL/SKU (Tipo, Stock (ud)). mapping: df Tipo, Categoría, Ud x pallet.
     El saldo de cada SKU (sobrante < 1 pallet) se redondea HACIA ARRIBA a un pallet entero,
@@ -590,6 +673,10 @@ def main():
         entrada_dia = (ide_trips * ide_pallets + smasac_trips * smasac_pallets
                        + reyemsa_trips * reyemsa_pallets) * growth
         st.caption(f"Entrada total ≈ **{entrada_dia:.0f} pallets/día** (con el factor x{growth:.2f}).")
+        st.divider()
+        st.markdown("**📉 Consumo real (opcional)**")
+        mov_file = st.file_uploader("Movimientos SAP MB51 (CSV/Excel)",
+                                    type=["csv", "xlsx", "xls"], key="mov")
 
     # ---- Construcción del stock inicial ----
     init_items = None
@@ -633,12 +720,33 @@ def main():
                     st.dataframe(detalle, hide_index=True, use_container_width=True)
                 st.divider()
 
+    # ---- Consumo real desde movimientos (opcional) ----
+    cons_override = None
+    if mov_file is not None:
+        try:
+            mov = parse_movimientos(mov_file)
+            detalle_c, dias_c, ovr = consumo_diario(mov)
+            st.subheader("📉 Consumo promedio diario (movimientos reales)")
+            st.caption(f"Calculado sobre **{dias_c} día(s)** del archivo. Para el modelo (consumo por "
+                       f"turno) se asume que las líneas no-cilindro operan en 2 turnos "
+                       f"(por turno = diario ÷ 2) y la de cilindros solo de día (por turno = diario). "
+                       f"Sube varios días completos para un promedio representativo.")
+            st.dataframe(detalle_c, hide_index=True, use_container_width=True)
+            usar = st.checkbox("Usar este consumo en la simulación (reemplaza los valores por defecto)",
+                               value=False)
+            if usar and ovr:
+                cons_override = ovr
+                st.success("✅ La simulación usará el consumo derivado de tus movimientos.")
+            st.divider()
+        except Exception as e:
+            st.error(f"No se pudo procesar el archivo de movimientos: {e}")
+
     # ---- Simulación ----
     df, S = run_simulation(initial_pct, growth, operator_cyl, buffer_pallets, init_items,
                            int(ide_trips), int(smasac_trips), int(reyemsa_trips),
                            float(min_store), float(min_supply),
                            float(ide_pallets), float(smasac_pallets), float(reyemsa_pallets),
-                           bool(incluir_almuerzo))
+                           bool(incluir_almuerzo), cons_override)
 
     if S["max_fict"] > 0.5:
         st.error(f"🚨 **RIESGO DE SEGURIDAD** — Zona Ficticia usada (máx. {S['max_fict']:.0f} pallets "
