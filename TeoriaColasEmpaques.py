@@ -223,13 +223,17 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                    lunch_break=True):
     inv = inv_from_items(init_items) if init_items is not None else build_initial_inventory(initial_pct)
 
+    # Los consumos de CONS_DAILY son POR TURNO. Las líneas de baldes y botellas operan en
+    # AMBOS turnos; la línea de cilindros opera SOLO en el turno día (T1).
     lunch_minutes = (LUNCH_END - LUNCH_START) if lunch_break else 0
-    prod_min = (PROD_END - PROD_START + 1) - lunch_minutes   # minutos en que las líneas producen
-    cons = {it: d * growth / prod_min for it, d in CONS_DAILY.items()}
-    caja_daily = (CONS_DAILY["Botella 1L"] * UNITS_PER_PALLET["Botella 1L"]
-                  / 12 / UNITS_PER_PALLET["Caja 12x1L"])
-    cons["Caja 12x1L"] = caja_daily * growth / prod_min
-    allowed_supply_rate = sum(r for it, r in cons.items() if it != "Cilindro")
+    day_min = (T1_END - T1_START + 1) - lunch_minutes      # min productivos turno día
+    night_min = (PROD_END - T1_END)                        # min productivos turno noche
+    caja_shift = (CONS_DAILY["Botella 1L"] * UNITS_PER_PALLET["Botella 1L"]
+                  / 12 / UNITS_PER_PALLET["Caja 12x1L"])    # cajas por turno (prop. a Bot. 1L)
+    per_shift = dict(CONS_DAILY); per_shift["Caja 12x1L"] = caja_shift
+    rate_day = {it: v * growth / day_min for it, v in per_shift.items()}
+    rate_night = {it: (0.0 if it == "Cilindro" else v * growth / night_min)
+                  for it, v in per_shift.items()}
 
     arrivals = defaultdict(list)
     ide_f = (ide_pallets / IDE_BASE) * growth
@@ -256,7 +260,7 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
     LINES_OP = ["Línea Baldes 1", "Línea Baldes 2", "Línea Botellas 1L", "Línea Botellas 4L"]
     LINE_KEYS = {"Línea Baldes 1": "sup_b1", "Línea Baldes 2": "sup_b2",
                  "Línea Botellas 1L": "sup_1l", "Línea Botellas 4L": "sup_4l"}
-    line_rate = {ln: sum(cons.get(it, 0.0) for it in LINE_ITEMS[ln]) for ln in LINES_OP}
+    line_rate = {ln: sum(rate_day.get(it, 0.0) for it in LINE_ITEMS[ln]) for ln in LINES_OP}
     line_backlog = {ln: 0.0 for ln in LINES_OP}
     cum_supplied = {ln: 0.0 for ln in LINES_OP}
 
@@ -276,14 +280,15 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                     unload_due += pallets
 
         if not on_lunch:                      # las líneas no producen durante el almuerzo
-            for it, r in cons.items():
+            rates = rate_day if in_t1 else rate_night    # cilindros solo consumen de día
+            for it, r in rates.items():
                 if r <= 0:
                     continue
                 inv[it] -= r
                 if inv[it] < 0:
                     inv[it] = 0.0
             for ln, items in LINE_ITEMS.items():
-                ceros = [it for it in items if it in cons and cons[it] > 0 and inv.get(it, 0.0) <= 1e-9]
+                ceros = [it for it in items if rates.get(it, 0.0) > 0 and inv.get(it, 0.0) <= 1e-9]
                 short = len(ceros) > 0
                 if short and not line_short[ln]:
                     quiebre_line[ln] += 1
@@ -700,6 +705,10 @@ def main():
 mapeo (editable). Cada `Tipo` se asigna a una categoría de bodega y se ubica con las mismas reglas
 de zonificación. Los `Tipo` no reconocidos caen por defecto en **otros** (desborde Mezanine 2 →
 Sótano → ILB → Zona Ficticia). Las unidades por pallet de tapas/liners son estimaciones a calibrar.
+
+**Consumo por turno.** Los valores de consumo son **por turno**. Las líneas de baldes y botellas
+operan en ambos turnos (el consumo diario es el doble); la línea de **cilindros solo opera en el
+turno día**. El Operario 1 abastece el consumo de su turno (día) dentro del T1.
 
 **Turnos.** T1 (Operario 1): 07:00–16:45. T2: 16:30–02:15 (solapamiento 15 min). La producción
 consume durante la ventana de turnos, salvo el almuerzo (12:00–12:45), en que las líneas se
