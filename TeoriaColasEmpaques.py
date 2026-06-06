@@ -11,6 +11,7 @@
 """
 
 import io
+import math
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -391,26 +392,35 @@ def default_mapping(tipos):
     return pd.DataFrame(rows)
 
 
-def items_from_mapping(grouped, mapping):
-    """grouped: df Tipo->Stock (ud). mapping: df Tipo, Categoría, Ud x pallet.
-    Devuelve (init_items_tuple, detalle_df)."""
+def items_from_mapping(raw, mapping):
+    """raw: df POR MATERIAL/SKU (Tipo, Stock (ud)). mapping: df Tipo, Categoría, Ud x pallet.
+    El saldo de cada SKU (sobrante < 1 pallet) se redondea HACIA ARRIBA a un pallet entero,
+    porque dos SKU distintos no comparten una posición de pallet."""
     m = mapping.set_index("Tipo")
     agg = defaultdict(float)
-    detalle = []
-    for _, r in grouped.iterrows():
+    det = {}
+    for _, r in raw.iterrows():
         tp = r["Tipo"]
         stock = float(r["Stock (ud)"])
-        cat = m.loc[tp, "Categoría"] if tp in m.index else "otros"
-        udp = float(m.loc[tp, "Ud x pallet"]) if tp in m.index else 1.0
-        if cat == "(ignorar)" or udp <= 0:
-            pallets = 0.0
+        if tp in m.index:
+            cat = m.loc[tp, "Categoría"]; udp = float(m.loc[tp, "Ud x pallet"])
         else:
-            pallets = stock / udp
+            cat, udp = "otros", 1.0
+        if cat != "(ignorar)" and udp > 0 and stock > 0:
+            pallets = int(math.ceil(stock / udp - 1e-9))   # saldo -> pallet entero
+        else:
+            pallets = 0
+        if cat != "(ignorar)" and pallets > 0:
             agg[CAT_REP[cat]] += pallets
-        detalle.append({"Tipo": tp, "Stock (ud)": stock, "Categoría": cat,
-                        "Ud x pallet": udp, "Pallets": round(pallets, 1)})
-    init_items = tuple(sorted((k, round(v, 4)) for k, v in agg.items()))
-    return init_items, pd.DataFrame(detalle)
+        d = det.setdefault(tp, {"Stock (ud)": 0.0, "SKUs": 0, "Pallets": 0})
+        d["Stock (ud)"] += stock; d["SKUs"] += 1; d["Pallets"] += pallets
+        d["Categoría"] = cat; d["Ud x pallet"] = udp
+    detalle = pd.DataFrame([
+        {"Tipo": tp, "Stock (ud)": v["Stock (ud)"], "SKUs": v["SKUs"],
+         "Categoría": v["Categoría"], "Ud x pallet": v["Ud x pallet"], "Pallets": v["Pallets"]}
+        for tp, v in det.items()])
+    init_items = tuple(sorted((k, float(v)) for k, v in agg.items()))
+    return init_items, detalle
 
 
 # =====================================================================
@@ -529,8 +539,9 @@ def main():
                 grouped = raw.groupby("Tipo", as_index=False)["Stock (ud)"].sum()
                 st.subheader("🗂️ Mapeo de materiales (Tipo SAP → categoría de bodega)")
                 st.caption("Ajusta la **categoría destino** y las **unidades por pallet** de cada tipo. "
-                           "Las unidades por pallet de tapas/liners son ESTIMADAS: verifícalas con tu "
-                           "maestro de materiales. Usa '(ignorar)' para excluir un tipo de la bodega.")
+                           "El saldo de cada SKU (sobrante menor a 1 pallet) se cuenta como **1 pallet "
+                           "entero**. Las unidades por pallet de tapas/liners son estimadas: verifícalas "
+                           "con tu maestro. Usa '(ignorar)' para excluir un tipo de la bodega.")
                 base_map = default_mapping(grouped["Tipo"].tolist())
                 edited = st.data_editor(
                     base_map, hide_index=True, use_container_width=True, key="mapeo",
@@ -541,7 +552,7 @@ def main():
                         "Ud x pallet": st.column_config.NumberColumn("Ud x pallet", min_value=0.0,
                                                                      step=1.0, format="%.0f"),
                     })
-                init_items, detalle = items_from_mapping(grouped, edited)
+                init_items, detalle = items_from_mapping(raw, edited)
                 inv0 = inv_from_items(init_items)
                 used0, fict0 = allocate_zones(inv0)
                 occ0 = 100.0 * sum(used0.values()) / TOTAL_POSITIONS
