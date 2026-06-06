@@ -119,7 +119,7 @@ SAP_DEFAULT_MAP = {
     "Manga Sachet":  ("(ignorar)", 999999),
     "Cinta":         ("(ignorar)", 999999),
     "Tapa Bombona":  ("(ignorar)", 999999),
-    "Funfa Pote":    ("(ignorar)", 999999),
+    "Funda Pote":    ("(ignorar)", 999999),
     "Tapa Bot Cilíndrica": ("(ignorar)",999999)
 }
 # Búsqueda normalizada (sin distinguir mayúsculas/espacios)
