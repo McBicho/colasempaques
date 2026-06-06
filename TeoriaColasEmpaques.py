@@ -96,7 +96,6 @@ SAP_DEFAULT_MAP = {
     "Cilindro":      ("cilindro", 4),
     "Balde 19L":     ("balde", 240),
     "Balde 2.5USG":  ("balde", 400),
-    "Bombona":       ("balde", 240),
     "Botella 1L":    ("bot1l", 1584),
     "Botella 4L":    ("bot4l", 480),
     "Caja":          ("caja", 750),
@@ -107,7 +106,19 @@ SAP_DEFAULT_MAP = {
     "Tapa Lt":       ("tapa_lg", 50000),
     "IBC CART":      ("otros", 1),
     "Pallet":        ("otros", 20),
+    # --- Tipos excluidos por defecto (fuera del alcance de esta bodega) ---
+    "Adhesivos":     ("(ignorar)", 1),
+    "DoyPack":       ("(ignorar)", 1),
+    "Botella 0.5L":  ("(ignorar)", 1),
+    "Bombona":       ("(ignorar)", 1),
+    "Etiquetas":     ("(ignorar)", 1),
+    "Pote 1LB":      ("(ignorar)", 1),
+    "Contenedor":    ("(ignorar)", 1),
+    "Manga Sachet":  ("(ignorar)", 1),
+    "Cinta":         ("(ignorar)", 1),
 }
+# Búsqueda normalizada (sin distinguir mayúsculas/espacios)
+SAP_DEFAULT_NORM = {k.strip().lower(): v for k, v in SAP_DEFAULT_MAP.items()}
 
 CONS_DAILY = {
     "Balde 19L": 13, "Tapa 19L": 7,
@@ -124,11 +135,12 @@ LINE_ITEMS = {
     "Línea Cilindros":  ["Cilindro"],
 }
 
-IDE_DAILY = {"Balde 19L": 38, "Tapa 19L": 22, "Balde 2.5USG": 24,
-             "Tapa 2.5USG": 8, "Tapa Lt": 2, "Tapa Gl": 2}
-SMASAC_DAILY = {"Botella 1L": 28, "Botella 4L": 30, "Caja 12x1L": 6}
-IDE_TRIPS, SMASAC_TRIPS, REYEMSA_TRIPS = 4, 4, 4
-REYEMSA_CIL_PER_TRIP = 50
+# Composición FIJA por viaje (pallets). Total diario = (pallets/viaje) x (nº de viajes).
+IDE_PER_TRIP = {"Balde 19L": 9.5, "Tapa 19L": 5.5, "Balde 2.5USG": 6.0,
+                "Tapa 2.5USG": 2.0, "Tapa Lt": 0.5, "Tapa Gl": 0.5}    # 24 pallets/viaje
+SMASAC_PER_TRIP = {"Botella 1L": 7.0, "Botella 4L": 7.5, "Caja 12x1L": 1.5}  # 16 pallets/viaje
+REYEMSA_CIL_PER_TRIP = 50          # 200 cilindros = 50 pallets/viaje
+IDE_TRIPS_DEF, SMASAC_TRIPS_DEF, REYEMSA_TRIPS_DEF = 4, 4, 4
 
 INIT_MIX = {
     "Cilindro": 0.14, "Balde 19L": 0.13, "Balde 2.5USG": 0.09,
@@ -193,7 +205,8 @@ def trip_sched(n, lo=0, hi=PROD_END, offset=0):
 # =====================================================================
 @st.cache_data(show_spinner=False)
 def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
-                   buffer_pallets=4.0, init_items=None):
+                   buffer_pallets=4.0, init_items=None,
+                   ide_trips=4, smasac_trips=4, reyemsa_trips=4):
     inv = inv_from_items(init_items) if init_items is not None else build_initial_inventory(initial_pct)
 
     prod_min = PROD_END - PROD_START
@@ -204,13 +217,13 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
     allowed_supply_rate = sum(r for it, r in cons.items() if it != "Cilindro")
 
     arrivals = defaultdict(list)
-    for tt in trip_sched(IDE_TRIPS, offset=0):
-        adds = {k: v / IDE_TRIPS * growth for k, v in IDE_DAILY.items()}
+    for tt in trip_sched(ide_trips, offset=0):
+        adds = {k: v * growth for k, v in IDE_PER_TRIP.items()}
         arrivals[tt].append((adds, sum(adds.values()), True))
-    for tt in trip_sched(SMASAC_TRIPS, offset=90):
-        adds = {k: v / SMASAC_TRIPS * growth for k, v in SMASAC_DAILY.items()}
+    for tt in trip_sched(smasac_trips, offset=90):
+        adds = {k: v * growth for k, v in SMASAC_PER_TRIP.items()}
         arrivals[tt].append((adds, sum(adds.values()), True))
-    for tt in trip_sched(REYEMSA_TRIPS, offset=45):
+    for tt in trip_sched(reyemsa_trips, offset=45):
         adds = {"Cilindro": REYEMSA_CIL_PER_TRIP * growth}
         arrivals[tt].append((adds, REYEMSA_CIL_PER_TRIP * growth, operator_unloads_cyl))
 
@@ -344,7 +357,7 @@ def parse_mb5b(uploaded):
 def default_mapping(tipos):
     rows = []
     for tp in tipos:
-        cat, udp = SAP_DEFAULT_MAP.get(tp, ("otros", 1))
+        cat, udp = SAP_DEFAULT_NORM.get(str(tp).strip().lower(), ("otros", 1))
         rows.append({"Tipo": tp, "Categoría": cat, "Ud x pallet": float(udp)})
     return pd.DataFrame(rows)
 
@@ -452,6 +465,12 @@ def main():
         st.metric("Factor aplicado", f"x{growth:.2f}")
         operator_cyl = st.checkbox("Operario 1 descarga cilindros (REYEMSA)", False)
         buffer_pallets = st.slider("Tolerancia de espera de líneas (pallets)", 1.0, 10.0, 4.0, 0.5)
+        st.markdown("**🚚 Camiones por día (viajes)**")
+        ide_trips = st.number_input("IDE · 24 pallets/viaje", 0, 12, IDE_TRIPS_DEF, 1)
+        smasac_trips = st.number_input("SMASAC · 16 pallets/viaje", 0, 12, SMASAC_TRIPS_DEF, 1)
+        reyemsa_trips = st.number_input("REYEMSA · 50 pallets cilindros/viaje", 0, 12, REYEMSA_TRIPS_DEF, 1)
+        entrada_dia = (ide_trips * 24 + smasac_trips * 16 + reyemsa_trips * 50) * growth
+        st.caption(f"Entrada total ≈ **{entrada_dia:.0f} pallets/día** (con el factor x{growth:.2f}).")
 
     # ---- Construcción del stock inicial ----
     init_items = None
@@ -495,7 +514,8 @@ def main():
                 st.divider()
 
     # ---- Simulación ----
-    df, S = run_simulation(initial_pct, growth, operator_cyl, buffer_pallets, init_items)
+    df, S = run_simulation(initial_pct, growth, operator_cyl, buffer_pallets, init_items,
+                           int(ide_trips), int(smasac_trips), int(reyemsa_trips))
 
     if S["max_fict"] > 0.5:
         st.error(f"🚨 **RIESGO DE SEGURIDAD** — Zona Ficticia usada (máx. {S['max_fict']:.0f} pallets "
