@@ -250,9 +250,19 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
     line_short = {ln: False for ln in LINE_ITEMS}
     quiebre_line = {ln: 0 for ln in LINE_ITEMS}
     quiebre_overload = 0
+    quiebre_events = []
+
+    # Abastecimiento por línea (solo las que atiende el Operario 1)
+    LINES_OP = ["Línea Baldes 1", "Línea Baldes 2", "Línea Botellas 1L", "Línea Botellas 4L"]
+    LINE_KEYS = {"Línea Baldes 1": "sup_b1", "Línea Baldes 2": "sup_b2",
+                 "Línea Botellas 1L": "sup_1l", "Línea Botellas 4L": "sup_4l"}
+    line_rate = {ln: sum(cons.get(it, 0.0) for it in LINE_ITEMS[ln]) for ln in LINES_OP}
+    line_backlog = {ln: 0.0 for ln in LINES_OP}
+    cum_supplied = {ln: 0.0 for ln in LINES_OP}
 
     rec = {"minute": [], "tiempo": [], "total_pct": [], "fict": [],
-           "s_min": [], "u_min": [], "i_min": [], "l_min": []}
+           "s_min": [], "u_min": [], "i_min": [], "l_min": [],
+           "sup_b1": [], "sup_b2": [], "sup_1l": [], "sup_4l": []}
     for z in ZONE_LIST:
         rec[z] = []
     for t in range(PROD_START, PROD_END + 1):
@@ -273,10 +283,14 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                 if inv[it] < 0:
                     inv[it] = 0.0
             for ln, items in LINE_ITEMS.items():
-                short = any((it in cons and cons[it] > 0 and inv.get(it, 0.0) <= 1e-9)
-                            for it in items)
+                ceros = [it for it in items if it in cons and cons[it] > 0 and inv.get(it, 0.0) <= 1e-9]
+                short = len(ceros) > 0
                 if short and not line_short[ln]:
                     quiebre_line[ln] += 1
+                    quiebre_events.append({
+                        "Hora": (BASE_DATE + timedelta(minutes=t)).strftime("%H:%M"),
+                        "Línea": ln, "Causa": "Sin stock en bodega",
+                        "Detalle": ", ".join(ceros)})
                 line_short[ln] = short
 
         s_min = u_min = i_min = l_min = 0.0
@@ -285,11 +299,18 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                 l_min = 1.0
                 t_lunch += 1.0
             else:
-                supply_backlog += allowed_supply_rate   # demanda solo si las líneas producen
+                for ln in LINES_OP:
+                    line_backlog[ln] += line_rate[ln]
+                supply_backlog = sum(line_backlog.values())
                 time_left = 1.0  # 1 minuto disponible por iteración
                 # 1) Prioridad absoluta: abastecer líneas (min_supply por pallet)
                 cap_s = time_left / max(min_supply, 1e-9)
                 served_s = min(supply_backlog, cap_s)
+                if supply_backlog > 1e-12:        # repartir lo servido entre líneas según su cola
+                    for ln in LINES_OP:
+                        s_ln = served_s * (line_backlog[ln] / supply_backlog)
+                        line_backlog[ln] -= s_ln
+                        cum_supplied[ln] += s_ln
                 supply_backlog -= served_s
                 time_left -= served_s * min_supply
                 # 2) Descargar/guardar camiones (min_store por pallet)
@@ -301,6 +322,10 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
                 t_supply += s_min; t_unload += u_min; t_idle += i_min
             if supply_backlog > buffer_pallets and not overloaded:
                 quiebre_overload += 1; overloaded = True
+                quiebre_events.append({
+                    "Hora": (BASE_DATE + timedelta(minutes=t)).strftime("%H:%M"),
+                    "Línea": "Abastecimiento (operario)", "Causa": "Sobrecarga del operario",
+                    "Detalle": f"cola {supply_backlog:.1f} pallets > tolerancia {buffer_pallets:.0f}"})
             elif supply_backlog <= buffer_pallets:
                 overloaded = False
 
@@ -311,6 +336,8 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
         rec["fict"].append(fict)
         rec["s_min"].append(s_min); rec["u_min"].append(u_min)
         rec["i_min"].append(i_min); rec["l_min"].append(l_min)
+        for ln, key in LINE_KEYS.items():
+            rec[key].append(cum_supplied[ln])
         for z in ZONE_LIST:
             rec[z].append(100.0 * used[z] / ZONE_CAP[z])
 
@@ -325,7 +352,8 @@ def run_simulation(initial_pct, growth, operator_unloads_cyl=False,
         "utilizacion": 100.0 * (t_supply + t_unload) / work_minutes,
         "unload_backlog": unload_due, "supply_backlog": supply_backlog,
         "quiebre_line": quiebre_line, "quiebre_overload": quiebre_overload,
-        "quiebres_total": sum(quiebre_line.values()) + quiebre_overload, "growth": growth,
+        "quiebres_total": sum(quiebre_line.values()) + quiebre_overload,
+        "quiebre_events": quiebre_events, "growth": growth,
     }
     return df, summary
 
@@ -426,6 +454,41 @@ def items_from_mapping(raw, mapping):
 # =====================================================================
 # 5. GRÁFICOS PLOTLY
 # =====================================================================
+def fig_abastecimiento_animado(df):
+    lines = ["Línea Baldes 1", "Línea Baldes 2", "Línea Botellas 1L", "Línea Botellas 4L"]
+    cols = ["sup_b1", "sup_b2", "sup_1l", "sup_4l"]
+    colors = ["#28B463", "#1E8449", "#2E86C1", "#5DADE2"]
+    dT1 = df[df["minute"] <= T1_END]
+    marks = list(range(0, T1_END + 1, 30))
+    if marks[-1] != T1_END:
+        marks.append(T1_END)
+    frames = []
+    for mk in marks:
+        row = dT1[dT1["minute"] <= mk].iloc[-1]
+        yv = [float(row[c]) for c in cols]
+        ts = (BASE_DATE + timedelta(minutes=int(mk))).strftime("%H:%M")
+        frames.append(go.Frame(name=ts, data=[go.Bar(
+            x=lines, y=yv, marker_color=colors,
+            text=[f"{v:.1f}" for v in yv], textposition="outside")]))
+    maxy = max(1.0, float(dT1[cols].iloc[-1].max()) * 1.25)
+    fig = go.Figure(data=list(frames[0].data), frames=frames)
+    fig.update_layout(
+        height=460, yaxis_title="Pallets abastecidos (acumulado)", yaxis_range=[0, maxy],
+        title="Avanza la barra de tiempo o pulsa ▶ para ver el abastecimiento acumulándose",
+        margin=dict(l=10, r=10, t=70, b=10),
+        updatemenus=[dict(type="buttons", showactive=False, x=0, y=1.25, xanchor="left",
+            buttons=[
+                dict(label="▶ Reproducir", method="animate",
+                     args=[None, dict(frame=dict(duration=250, redraw=True), fromcurrent=True)]),
+                dict(label="⏸ Pausa", method="animate",
+                     args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")])])],
+        sliders=[dict(active=0, x=0, y=0, len=1.0, currentvalue=dict(prefix="Hora: "),
+            steps=[dict(method="animate", label=f.name,
+                        args=[[f.name], dict(frame=dict(duration=0, redraw=True), mode="immediate")])
+                   for f in frames])])
+    return fig
+
+
 def fig_ocupacion(df):
     fig = go.Figure()
     for i, z in enumerate(ZONE_LIST):
@@ -600,8 +663,18 @@ def main():
     with g2:
         st.plotly_chart(fig_operario_dona(S), use_container_width=True)
     if S["unload_backlog"] > 1:
-        st.warning(f"⚠️ El operario cerró el turno con **{S['unload_backlog']:.0f} pallets sin "
-                   f"descargar** por la prioridad de abastecimiento.")
+        st.warning(f"⚠️ El operario cerró el Turno 1 con **{S['unload_backlog']:.0f} pallets sin "
+                   f"descargar**. No es por falta de tiempo total: corresponde a camiones que "
+                   f"llegaron demasiado cerca del fin de turno (16:45) como para alcanzar a guardarlos. "
+                   f"El tiempo muerto previo ocurrió *antes* de que esos camiones llegaran, así que no "
+                   f"era aprovechable (no se puede descargar un camión que aún no está en el andén). "
+                   f"Esos pallets los termina el Turno 2.")
+    st.divider()
+
+    st.subheader("2b · Abastecimiento a líneas (acumulado, animado)")
+    st.caption("Pallets que el Operario 1 lleva a cada línea durante el Turno 1. Pulsa ▶ o mueve la "
+               "barra de tiempo para ver cómo se acumula a lo largo del día.")
+    st.plotly_chart(fig_abastecimiento_animado(df), use_container_width=True)
     st.divider()
 
     col_a, col_b = st.columns(2)
@@ -609,10 +682,16 @@ def main():
         st.subheader("3 · Ocupación por zona al cierre")
         st.plotly_chart(fig_zonas_final(df), use_container_width=True)
     with col_b:
-        st.subheader("4 · Detalle de quiebres de stock")
+        st.subheader("4 · Quiebres de stock: conteo y causas")
         rows = [{"Origen": ln, "Quiebres": n} for ln, n in S["quiebre_line"].items()]
         rows.append({"Origen": "Sobrecarga del operario", "Quiebres": S["quiebre_overload"]})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        ev = S.get("quiebre_events", [])
+        if ev:
+            st.markdown("**¿Cuándo y por qué?**")
+            st.dataframe(pd.DataFrame(ev), use_container_width=True, hide_index=True)
+        else:
+            st.success("Sin quiebres en este escenario.")
         st.metric("Backlog de abastecimiento al cierre", f"{S['supply_backlog']:.1f} pallets")
 
     with st.expander("📘 Acerca del modelo y supuestos"):
